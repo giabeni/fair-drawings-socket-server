@@ -32,4 +32,7 @@ export enum DrawEventType {
   // Handling signature
   UNAUTHORIZED_COMMIT_SIGNATURE = 'UNAUTHORIZED_COMMIT_SIGNATURE',
   UNAUTHORIZED_REVEAL_SIGNATURE = 'UNAUTHORIZED_REVEAL_SIGNATURE',
+
+  // Acknolodgements
+  ACK = 'ACK',
 }

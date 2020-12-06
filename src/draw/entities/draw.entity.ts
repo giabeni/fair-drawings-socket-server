@@ -58,6 +58,16 @@ export class Draw<D = DrawData> {
    */
   public readonly reveals?: (Reveal & { valid?: boolean })[] = [];
 
+  /**
+   * Timestamp of the creation date
+   */
+  public creationTimestamp?: number;
+
+  public winnerAcks?: {
+    userId: string;
+    winner: Candidate;
+  }[] = [];
+
   constructor(draw?: Draw<D>) {
     if (draw) {
       Object.assign(this, draw);

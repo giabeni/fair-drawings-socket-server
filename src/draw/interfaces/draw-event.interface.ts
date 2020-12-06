@@ -7,10 +7,11 @@ import { Candidate } from '../entities/candidate.entity';
 import { SignedCommit } from '../../commit-reveal/interfaces/signed-commit.interface';
 import { SignedReveal } from '../../commit-reveal/interfaces/signed-reveal.interface';
 import { Reveal } from '../../commit-reveal/interfaces/reveal.interface';
+import { DrawAck } from './draw-ack.interface';
 
 export type DrawEvent = {
   drawUuid?: string;
-  timestamp: number;
+  timestamp?: number;
   from?: Stakeholder;
   eventId?: string;
 } & (
@@ -47,14 +48,6 @@ export type DrawEvent = {
       data: SignedReveal;
     }
   | {
-      type: DrawEventType.ALL_COMMITS_RECEIVED;
-      data: Commit[];
-    }
-  | {
-      type: DrawEventType.ALL_REVEALS_RECEIVED;
-      data: Reveal[];
-    }
-  | {
       type: DrawEventType.STATUS_CHANGED;
       data: DrawStatus;
     }
@@ -85,5 +78,9 @@ export type DrawEvent = {
   | {
       type: DrawEventType.UNAUTHORIZED_REVEAL_SIGNATURE;
       data: SignedReveal;
+    }
+  | {
+      type: DrawEventType.ACK;
+      data: DrawAck;
     }
 );

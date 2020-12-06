@@ -21,7 +21,11 @@ import { DrawEventType } from './enums/draw-event-type.enum';
 import { Candidate } from './entities/candidate.entity';
 import { Stakeholder } from './entities/stakeholder.entity';
 import { DrawEvent } from './interfaces/draw-event.interface';
+import { DrawAckType } from './enums/draw-ack-type.enum';
+import { DrawStatus } from './enums/draw-status.enum';
+import firebase from 'firebase';
 
+type User = firebase.User;
 @WebSocketGateway()
 export class DrawGateway
   implements OnGatewayConnection, OnGatewayDisconnect, OnGatewayInit {
@@ -30,7 +34,8 @@ export class DrawGateway
 
   draws: Draw[] = [];
 
-  drawsRef: CollectionReference<any>;
+  drawsRef: CollectionReference<Draw>;
+  keysRef: CollectionReference<{ publicKey?: JsonWebKey }>;
 
   constructor(
     @InjectFirebaseAdmin() private readonly firebase: FirebaseAdmin,
@@ -38,14 +43,17 @@ export class DrawGateway
 
   afterInit() {
     this.drawsRef = this.firebase.db.collection('draws');
+    this.keysRef = this.firebase.db.collection('keys');
 
     this.drawsRef.onSnapshot((drawsSnapshot: QuerySnapshot) => {
-      this.draws = drawsSnapshot.docs.map((doc) => {
-        return {
-          uuid: doc.id,
-          ...doc.data(),
-        };
-      });
+      this.draws = drawsSnapshot.docs
+        .map((doc) => {
+          return {
+            uuid: doc.id,
+            ...doc.data(),
+          };
+        })
+        .sort((a: Draw, b: Draw) => b.creationTimestamp - a.creationTimestamp);
       this.server.emit('getDrawList', this.draws);
     });
   }
@@ -62,27 +70,43 @@ export class DrawGateway
   }
 
   @UseGuards(FirebaseAuthGuard)
-  @SubscribeMessage('getDrawList')
-  async onGetDrawList(
-    @MessageBody() data: any,
+  @SubscribeMessage('sendPublicKey')
+  async onSendPublicKey(
+    @MessageBody() [publicKey, user]: [JsonWebKey, User, string],
     @ConnectedSocket() client: Socket,
   ) {
+    const userKeyDoc = await this.keysRef
+      .doc(user.uid)
+      .set({ publicKey })
+      .catch((err) => {
+        console.error(err);
+        return undefined;
+      });
+
+    if (!userKeyDoc) {
+      client.emit('connectionApproved', false);
+      throw new WsException('ERR_SAVE_KEY_DOC');
+    }
+
+    client.emit('connectionApproved', true);
+  }
+
+  @UseGuards(FirebaseAuthGuard)
+  @SubscribeMessage('getDrawList')
+  async onGetDrawList(@ConnectedSocket() client: Socket) {
     client.emit('getDrawList', this.draws);
   }
 
   @UseGuards(FirebaseAuthGuard)
   @SubscribeMessage('createDraw')
   async onCreateDraw(
-    @MessageBody() drawBody: Draw,
+    @MessageBody() [drawBody]: [Draw],
     @ConnectedSocket() client: Socket,
   ) {
-    console.log(
-      `🚀 ~ file: draw.gateway.ts ~ line 52 ~ DrawGateway ~ drawBody`,
-      drawBody,
-    );
-
     drawBody.status = 0;
     drawBody.stakeholders = [];
+    drawBody.creationTimestamp = new Date().getTime();
+    drawBody.spots = Number(drawBody.spots);
 
     const createdDoc = await this.drawsRef
       .doc(drawBody.uuid)
@@ -102,7 +126,7 @@ export class DrawGateway
   @UseGuards(FirebaseAuthGuard)
   @SubscribeMessage('getDraw')
   async onGetDraw(
-    @MessageBody() data: { user: any; drawUuid: string },
+    @MessageBody() [data]: [{ drawUuid: string }],
     @ConnectedSocket() client: Socket,
   ) {
     const drawDoc = this.drawsRef.doc(data.drawUuid);
@@ -120,9 +144,14 @@ export class DrawGateway
     }
 
     draw.stakeholders = (await Promise.all(
-      (draw.stakeholders || []).map(async (user: any) => {
-        const userRecord = await auth().getUser(user.uid || user.id);
+      (draw.stakeholders || []).map(async (user: Candidate) => {
+        const userRecord = await auth().getUser(user.id);
+        const keySnapshot = await this.keysRef.doc(user.id).get();
 
+        if (!keySnapshot.exists || !keySnapshot.data().publicKey) {
+          console.error('KEY_NOT_FOUND');
+          throw new WsException('KEY_NOT_FOUND');
+        }
         return new Candidate<any>({
           id: userRecord.uid,
           indexes: user.indexes,
@@ -133,11 +162,10 @@ export class DrawGateway
             lastName: userRecord.displayName.split(' ', 2)[1],
             avatar: userRecord.photoURL,
           },
+          publicKey: keySnapshot.data().publicKey,
         });
       }),
     )) as Candidate<any>[];
-
-    console.log('Draw before emit', draw);
 
     client.emit('getDraw', draw);
   }
@@ -145,9 +173,18 @@ export class DrawGateway
   @UseGuards(FirebaseAuthGuard)
   @SubscribeMessage('joinDraw')
   async onJoinDraw(
-    @MessageBody() data: { stakeholder: Stakeholder; drawUuid: string },
+    @MessageBody()
+    [data, user]: [{ stakeholder: Stakeholder; drawUuid: string }, User],
     @ConnectedSocket() client: Socket,
   ) {
+    if (!(data && data.stakeholder && data.drawUuid)) {
+      throw new WsException('MISSING_INFORMATION');
+    }
+
+    if (user.uid !== data.stakeholder.id) {
+      throw new WsException('FORBIDDEN_STAKEHOLDER');
+    }
+
     const drawDoc = this.drawsRef.doc(data.drawUuid);
 
     const drawSnapshot = await drawDoc.get();
@@ -166,7 +203,12 @@ export class DrawGateway
       throw new WsException('STAKEHOLDER_ALREADY_REGISTERED');
     }
 
-    console.log(`🚀 ~ file: draw.gateway.ts ~ line 177 ~ data`, data);
+    const keySnapshot = await this.keysRef.doc(user.uid).get();
+
+    if (!keySnapshot.exists || !keySnapshot.data().publicKey) {
+      throw new WsException('KEY_NOT_FOUND');
+    }
+
     const candidate: Candidate = {
       ...data.stakeholder,
       indexes: [draw.stakeholders ? draw.stakeholders.length : 0],
@@ -191,32 +233,43 @@ export class DrawGateway
     )) as Candidate;
     fullCandidate.eligible = true;
     fullCandidate.indexes = candidate.indexes;
+    fullCandidate.publicKey = keySnapshot.data().publicKey;
 
     const event: DrawEvent = {
       timestamp: new Date().getTime(),
       type: DrawEventType.CANDIDATE_SUBSCRIBED,
       data: fullCandidate,
       drawUuid: data.drawUuid,
+      eventId: (+new Date()).toString(36),
+      from: {
+        id: fullCandidate.id,
+      },
     };
 
-    console.log(`🚀 ~ file: draw.gateway.ts ~ line 206 ~ event`, event);
-    console.log('Rooms client is in', client.rooms);
     client.server.to(data.drawUuid).emit('drawEvent', event);
   }
 
   @UseGuards(FirebaseAuthGuard)
   @SubscribeMessage('listenDraw')
   async onListenToDraw(
-    @MessageBody() data: { user: any; drawUuid: string },
+    @MessageBody() [data]: [{ user: any; drawUuid: string }],
     @ConnectedSocket() client: Socket,
   ) {
     client.join(data.drawUuid);
 
+    const stakeholder = await this.getStakeholderFromUserId(
+      data.user.id || data.user.uid,
+    );
+
     const event: DrawEvent = {
       timestamp: new Date().getTime(),
       type: DrawEventType.STAKEHOLDER_SUBSCRIBED,
-      data: await this.getStakeholderFromUserId(data.user.id || data.user.uid),
+      data: stakeholder,
       drawUuid: data.drawUuid,
+      eventId: (+new Date()).toString(36),
+      from: {
+        id: stakeholder.id,
+      },
     };
 
     const draw = this.draws.find((draw) => draw.uuid === data.drawUuid);
@@ -231,7 +284,7 @@ export class DrawGateway
   @UseGuards(FirebaseAuthGuard)
   @SubscribeMessage('postToDraw')
   async onPostToDraw(
-    @MessageBody() event: DrawEvent,
+    @MessageBody() [event]: [DrawEvent],
     @ConnectedSocket() client: Socket,
   ) {
     console.log('> Event to draw ', event);
@@ -247,6 +300,50 @@ export class DrawGateway
     event.eventId = (+new Date()).toString(36);
 
     client.server.to(event.drawUuid).emit('drawEvent', event);
+
+    if (
+      event.type === DrawEventType.ACK &&
+      event.data.type === DrawAckType.FINISHED
+    ) {
+      const drawInstance = this.draws.find(
+        (draw) => draw.uuid === event.drawUuid,
+      );
+
+      if (
+        drawInstance &&
+        drawInstance.status === DrawStatus.REVEAL &&
+        drawInstance.stakeholders.find(
+          (stk) => stk.eligible && stk.id === event.from.id,
+        ) &&
+        (!drawInstance.winnerAcks ||
+          !drawInstance.winnerAcks.find((ack) => ack.userId === event.from.id))
+      ) {
+        if (!drawInstance.winnerAcks) {
+          drawInstance.winnerAcks = [];
+        }
+
+        drawInstance.winnerAcks.push({
+          userId: event.from.id,
+          winner: event.data.winner,
+        });
+      }
+
+      const firstWinnerAck = drawInstance.winnerAcks[0];
+      if (
+        drawInstance.winnerAcks.length === Number(drawInstance.spots) &&
+        drawInstance.winnerAcks.every(
+          (ack) => ack.winner.id === firstWinnerAck.winner.id,
+        )
+      ) {
+        const drawDoc = await this.drawsRef.doc(event.drawUuid).get();
+
+        if (drawDoc.exists && !drawDoc.data().winner) {
+          await this.drawsRef.doc(event.drawUuid).update({
+            winner: firstWinnerAck.winner,
+          });
+        }
+      }
+    }
 
     if (event.type === DrawEventType.STATUS_CHANGED) {
       const drawDoc = await this.drawsRef.doc(event.drawUuid).get();
